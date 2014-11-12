@@ -463,3 +463,137 @@ func escapedStringToEncodedBytes(escapedString string) (string, error) {
 	}
 	return buffer.String(), nil
 }
+
+func ServerApplyFilter(f *ber.Packet, entry *Entry) (bool, uint64) {
+	//log.Printf("%# v", pretty.Formatter(entry))
+
+	switch FilterMap[f.Tag] {
+	default:
+		//log.Fatalf("Unknown LDAP filter code: %d", f.Tag)
+		return false, LDAPResultOperationsError
+	case "Equality Match":
+		if len(f.Children) != 2 {
+			return false, LDAPResultOperationsError
+		}
+		attribute := f.Children[0].Value.(string)
+		value := f.Children[1].Value.(string)
+		for _, a := range entry.Attributes {
+			if strings.ToLower(a.Name) == strings.ToLower(attribute) {
+				for _, v := range a.Values {
+					if strings.ToLower(v) == strings.ToLower(value) {
+						return true, LDAPResultSuccess
+					}
+				}
+			}
+		}
+	case "Present":
+		for _, a := range entry.Attributes {
+			if strings.ToLower(a.Name) == strings.ToLower(f.Data.String()) {
+				return true, LDAPResultSuccess
+			}
+		}
+	case "And":
+		for _, child := range f.Children {
+			ok, exitCode := ServerApplyFilter(child, entry)
+			if exitCode != LDAPResultSuccess {
+				return false, exitCode
+			}
+			if !ok {
+				return false, LDAPResultSuccess
+			}
+		}
+		return true, LDAPResultSuccess
+	case "Or":
+		anyOk := false
+		for _, child := range f.Children {
+			ok, exitCode := ServerApplyFilter(child, entry)
+			if exitCode != LDAPResultSuccess {
+				return false, exitCode
+			} else if ok {
+				anyOk = true
+			}
+		}
+		if anyOk {
+			return true, LDAPResultSuccess
+		}
+	case "Not":
+		if len(f.Children) != 1 {
+			return false, LDAPResultOperationsError
+		}
+		ok, exitCode := ServerApplyFilter(f.Children[0], entry)
+		if exitCode != LDAPResultSuccess {
+			return false, exitCode
+		} else if !ok {
+			return true, LDAPResultSuccess
+		}
+	case "FilterSubstrings":
+		return false, LDAPResultOperationsError
+	case "FilterGreaterOrEqual":
+		return false, LDAPResultOperationsError
+	case "FilterLessOrEqual":
+		return false, LDAPResultOperationsError
+	case "FilterApproxMatch":
+		return false, LDAPResultOperationsError
+	case "FilterExtensibleMatch":
+		return false, LDAPResultOperationsError
+	}
+
+	return false, LDAPResultSuccess
+}
+
+func GetFilterType(filter string) (string, error) { // TODO <- test this
+	f, err := CompileFilter(filter)
+	if err != nil {
+		return "", err
+	}
+	return parseFilterType(f)
+}
+
+func parseFilterType(f *ber.Packet) (string, error) {
+	searchType := ""
+	switch FilterMap[f.Tag] {
+	case "Equality Match":
+		if len(f.Children) != 2 {
+			return "", errors.New("Equality match must have only two children")
+		}
+		attribute := strings.ToLower(f.Children[0].Value.(string))
+		value := f.Children[1].Value.(string)
+
+		if attribute == "objectclass" {
+			searchType = strings.ToLower(value)
+		}
+	case "And":
+		for _, child := range f.Children {
+			subType, err := parseFilterType(child)
+			if err != nil {
+				return "", err
+			}
+			if len(subType) > 0 {
+				searchType = subType
+			}
+		}
+	case "Or":
+		for _, child := range f.Children {
+			subType, err := parseFilterType(child)
+			if err != nil {
+				return "", err
+			}
+			if len(subType) > 0 {
+				searchType = subType
+			}
+		}
+	case "Not":
+		if len(f.Children) != 1 {
+			return "", errors.New("Not filter must have only one child")
+		}
+		subType, err := parseFilterType(f.Children[0])
+		if err != nil {
+			return "", err
+		}
+		if len(subType) > 0 {
+			searchType = subType
+		}
+
+	}
+	return strings.ToLower(searchType), nil
+}

@@ -82,6 +82,12 @@ var BeheraPasswordPolicyErrorMap = map[int8]string{
 	BeheraPasswordInHistory:           "New password is in list of old passwords",
 }
 
+// Other LDAP constants
+const (
+	LDAPBindAuthSimple = 0
+	LDAPBindAuthSASL   = 3
+)
+
 // Adds descriptions to an LDAP Response packet for debugging
 func addLDAPDescriptions(packet *ber.Packet) (err error) {
 	defer func() {
