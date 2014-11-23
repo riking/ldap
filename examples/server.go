@@ -24,7 +24,9 @@ func main() {
 	s.SearchFunc("", handler)
 
 	// start the server
-	if err := s.ListenAndServe("localhost:3389"); err != nil {
+	listen := "localhost:3389"
+	log.Printf("Starting example LDAP server on %s", listen)
+	if err := s.ListenAndServe(listen); err != nil {
 		log.Fatal("LDAP Server Failed: %s", err.Error())
 	}
 }
@@ -33,7 +35,7 @@ type ldapHandler struct {
 }
 
 ///////////// Allow anonymous binds only
-func (h ldapHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (uint64, error) {
+func (h ldapHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (ldap.LDAPResultCode, error) {
 	if bindDN == "" && bindSimplePw == "" {
 		return ldap.LDAPResultSuccess, nil
 	}

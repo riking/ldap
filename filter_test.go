@@ -251,3 +251,27 @@ func BenchmarkFilterDecompile(b *testing.B) {
 		DecompileFilter(filters[i%maxIdx])
 	}
 }
+
+func TestGetFilterObjectClass(t *testing.T) {
+	c, err := GetFilterObjectClass("(objectClass=*)")
+	if err != nil {
+		t.Errorf("GetFilterObjectClass failed")
+	}
+	if c != "" {
+		t.Errorf("GetFilterObjectClass failed")
+	}
+	c, err = GetFilterObjectClass("(objectClass=posixAccount)")
+	if err != nil {
+		t.Errorf("GetFilterObjectClass failed")
+	}
+	if c != "posixaccount" {
+		t.Errorf("GetFilterObjectClass failed")
+	}
+	c, err = GetFilterObjectClass("(&(cn=awesome)(objectClass=posixGroup))")
+	if err != nil {
+		t.Errorf("GetFilterObjectClass failed")
+	}
+	if c != "posixgroup" {
+		t.Errorf("GetFilterObjectClass failed")
+	}
+}

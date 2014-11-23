@@ -464,10 +464,8 @@ func escapedStringToEncodedBytes(escapedString string) (string, error) {
 	return buffer.String(), nil
 }
 
-func ServerApplyFilter(f *ber.Packet, entry *Entry) (bool, uint64) {
-	//log.Printf("%# v", pretty.Formatter(entry))
-
-	switch FilterMap[f.Tag] {
+func ServerApplyFilter(f *ber.Packet, entry *Entry) (bool, LDAPResultCode) {
+	switch FilterMap[uint64(f.Tag)] {
 	default:
 		//log.Fatalf("Unknown LDAP filter code: %d", f.Tag)
 		return false, LDAPResultOperationsError
@@ -526,74 +524,73 @@ func ServerApplyFilter(f *ber.Packet, entry *Entry) (bool, uint64) {
 		} else if !ok {
 			return true, LDAPResultSuccess
 		}
-	case "FilterSubstrings":
+	case "FilterSubstrings": // TODO
 		return false, LDAPResultOperationsError
-	case "FilterGreaterOrEqual":
+	case "FilterGreaterOrEqual": // TODO
 		return false, LDAPResultOperationsError
-	case "FilterLessOrEqual":
+	case "FilterLessOrEqual": // TODO
 		return false, LDAPResultOperationsError
-	case "FilterApproxMatch":
+	case "FilterApproxMatch": // TODO
 		return false, LDAPResultOperationsError
-	case "FilterExtensibleMatch":
+	case "FilterExtensibleMatch": // TODO
 		return false, LDAPResultOperationsError
 	}
 
 	return false, LDAPResultSuccess
 }
 
-func GetFilterType(filter string) (string, error) { // TODO <- test this
+func GetFilterObjectClass(filter string) (string, error) {
 	f, err := CompileFilter(filter)
 	if err != nil {
 		return "", err
 	}
-	return parseFilterType(f)
+	return parseFilterObjectClass(f)
 }
 
-func parseFilterType(f *ber.Packet) (string, error) {
-	searchType := ""
-	switch FilterMap[f.Tag] {
+func parseFilterObjectClass(f *ber.Packet) (string, error) {
+	objectClass := ""
+	switch FilterMap[uint64(f.Tag)] {
 	case "Equality Match":
 		if len(f.Children) != 2 {
 			return "", errors.New("Equality match must have only two children")
 		}
 		attribute := strings.ToLower(f.Children[0].Value.(string))
 		value := f.Children[1].Value.(string)
-
 		if attribute == "objectclass" {
-			searchType = strings.ToLower(value)
+			objectClass = strings.ToLower(value)
 		}
 	case "And":
 		for _, child := range f.Children {
-			subType, err := parseFilterType(child)
+			subType, err := parseFilterObjectClass(child)
 			if err != nil {
 				return "", err
 			}
 			if len(subType) > 0 {
-				searchType = subType
+				objectClass = subType
 			}
 		}
 	case "Or":
 		for _, child := range f.Children {
-			subType, err := parseFilterType(child)
+			subType, err := parseFilterObjectClass(child)
 			if err != nil {
 				return "", err
 			}
 			if len(subType) > 0 {
-				searchType = subType
+				objectClass = subType
 			}
 		}
 	case "Not":
 		if len(f.Children) != 1 {
 			return "", errors.New("Not filter must have only one child")
 		}
-		subType, err := parseFilterType(f.Children[0])
+		subType, err := parseFilterObjectClass(f.Children[0])
 		if err != nil {
 			return "", err
 		}
 		if len(subType) > 0 {
-			searchType = subType
+			objectClass = subType
 		}
 
 	}
-	return strings.ToLower(searchType), nil
+	return strings.ToLower(objectClass), nil
 }

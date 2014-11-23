@@ -2,9 +2,7 @@ package ldap
 
 import (
 	"crypto/tls"
-	"errors"
-	"fmt"
-	"github.com/nmcclain/asn1-ber"
+	"gopkg.in/asn1-ber.v1"
 	"io"
 	"log"
 	"net"
@@ -13,23 +11,55 @@ import (
 )
 
 type Binder interface {
-	Bind(bindDN, bindSimplePw string, conn net.Conn) (uint64, error)
+	Bind(bindDN, bindSimplePw string, conn net.Conn) (LDAPResultCode, error)
 }
 type Searcher interface {
-	Search(boundDN string, searchReq SearchRequest, conn net.Conn) (ServerSearchResult, error)
+	Search(boundDN string, req SearchRequest, conn net.Conn) (ServerSearchResult, error)
+}
+type Adder interface {
+	Add(boundDN string, req AddRequest, conn net.Conn) (LDAPResultCode, error)
+}
+type Modifier interface {
+	Modify(boundDN string, req ModifyRequest, conn net.Conn) (LDAPResultCode, error)
+}
+type Deleter interface {
+	Delete(boundDN, deleteDN string, conn net.Conn) (LDAPResultCode, error)
+}
+type ModifyDNr interface {
+	ModifyDN(boundDN string, req ModifyDNRequest, conn net.Conn) (LDAPResultCode, error)
+}
+type Comparer interface {
+	Compare(boundDN string, req CompareRequest, conn net.Conn) (LDAPResultCode, error)
+}
+type Abandoner interface {
+	Abandon(boundDN string, conn net.Conn) error
+}
+type Extender interface {
+	Extended(boundDN string, req ExtendedRequest, conn net.Conn) (LDAPResultCode, error)
+}
+type Unbinder interface {
+	Unbind(boundDN string, conn net.Conn) (LDAPResultCode, error)
 }
 type Closer interface {
-	Close(conn net.Conn) error
+	Close(boundDN string, conn net.Conn) error
 }
 
-/////////////////////////
+//
 type Server struct {
-	bindFns     map[string]Binder
-	searchFns   map[string]Searcher
-	closeFns    map[string]Closer
-	quit        chan bool
+	BindFns     map[string]Binder
+	SearchFns   map[string]Searcher
+	AddFns      map[string]Adder
+	ModifyFns   map[string]Modifier
+	DeleteFns   map[string]Deleter
+	ModifyDNFns map[string]ModifyDNr
+	CompareFns  map[string]Comparer
+	AbandonFns  map[string]Abandoner
+	ExtendedFns map[string]Extender
+	UnbindFns   map[string]Unbinder
+	CloseFns    map[string]Closer
+	Quit        chan bool
 	EnforceLDAP bool
-	stats       *Stats
+	Stats       *Stats
 }
 
 type Stats struct {
@@ -44,35 +74,75 @@ type ServerSearchResult struct {
 	Entries    []*Entry
 	Referrals  []string
 	Controls   []Control
-	ResultCode uint64
+	ResultCode LDAPResultCode
 }
 
-/////////////////////////
+//
 func NewServer() *Server {
 	s := new(Server)
-	s.quit = make(chan bool)
+	s.Quit = make(chan bool)
 
 	d := defaultHandler{}
-	s.bindFns = make(map[string]Binder)
-	s.searchFns = make(map[string]Searcher)
-	s.closeFns = make(map[string]Closer)
-	s.bindFns[""] = d
-	s.searchFns[""] = d
-	s.closeFns[""] = d
-	s.stats = nil
+	s.BindFns = make(map[string]Binder)
+	s.SearchFns = make(map[string]Searcher)
+	s.AddFns = make(map[string]Adder)
+	s.ModifyFns = make(map[string]Modifier)
+	s.DeleteFns = make(map[string]Deleter)
+	s.ModifyDNFns = make(map[string]ModifyDNr)
+	s.CompareFns = make(map[string]Comparer)
+	s.AbandonFns = make(map[string]Abandoner)
+	s.ExtendedFns = make(map[string]Extender)
+	s.UnbindFns = make(map[string]Unbinder)
+	s.CloseFns = make(map[string]Closer)
+	s.BindFunc("", d)
+	s.SearchFunc("", d)
+	s.AddFunc("", d)
+	s.ModifyFunc("", d)
+	s.DeleteFunc("", d)
+	s.ModifyDNFunc("", d)
+	s.CompareFunc("", d)
+	s.AbandonFunc("", d)
+	s.ExtendedFunc("", d)
+	s.UnbindFunc("", d)
+	s.CloseFunc("", d)
+	s.Stats = nil
 	return s
 }
-func (server *Server) BindFunc(baseDN string, bindFn Binder) {
-	server.bindFns[baseDN] = bindFn
+func (server *Server) BindFunc(baseDN string, f Binder) {
+	server.BindFns[baseDN] = f
 }
-func (server *Server) SearchFunc(baseDN string, searchFn Searcher) {
-	server.searchFns[baseDN] = searchFn
+func (server *Server) SearchFunc(baseDN string, f Searcher) {
+	server.SearchFns[baseDN] = f
 }
-func (server *Server) CloseFunc(baseDN string, closeFn Closer) {
-	server.closeFns[baseDN] = closeFn
+func (server *Server) AddFunc(baseDN string, f Adder) {
+	server.AddFns[baseDN] = f
+}
+func (server *Server) ModifyFunc(baseDN string, f Modifier) {
+	server.ModifyFns[baseDN] = f
+}
+func (server *Server) DeleteFunc(baseDN string, f Deleter) {
+	server.DeleteFns[baseDN] = f
+}
+func (server *Server) ModifyDNFunc(baseDN string, f ModifyDNr) {
+	server.ModifyDNFns[baseDN] = f
+}
+func (server *Server) CompareFunc(baseDN string, f Comparer) {
+	server.CompareFns[baseDN] = f
+}
+func (server *Server) AbandonFunc(baseDN string, f Abandoner) {
+	server.AbandonFns[baseDN] = f
+}
+func (server *Server) ExtendedFunc(baseDN string, f Extender) {
+	server.ExtendedFns[baseDN] = f
+}
+func (server *Server) UnbindFunc(baseDN string, f Unbinder) {
+	server.UnbindFns[baseDN] = f
+}
+func (server *Server) CloseFunc(baseDN string, f Closer) {
+	server.CloseFns[baseDN] = f
 }
 func (server *Server) QuitChannel(quit chan bool) {
-	server.quit = quit
+	server.Quit = quit
 }
 
 func (server *Server) ListenAndServeTLS(listenString string, certFile string, keyFile string) error {
@@ -95,18 +165,18 @@ func (server *Server) ListenAndServeTLS(listenString string, certFile string, ke
 
 func (server *Server) SetStats(enable bool) {
 	if enable {
-		server.stats = &Stats{}
+		server.Stats = &Stats{}
 	} else {
-		server.stats = nil
+		server.Stats = nil
 	}
 }
 
 func (server *Server) GetStats() Stats {
 	defer func() {
-		server.stats.statsMutex.Unlock()
+		server.Stats.statsMutex.Unlock()
 	}()
-	server.stats.statsMutex.Lock()
-	return *server.stats
+	server.Stats.statsMutex.Lock()
+	return *server.Stats
 }
 
 func (server *Server) ListenAndServe(listenString string) error {
@@ -140,9 +210,9 @@ listener:
 	for {
 		select {
 		case c := <-newConn:
-			server.stats.countConns(1)
+			server.Stats.countConns(1)
 			go server.handleConnection(c)
-		case <-server.quit:
+		case <-server.Quit:
 			ln.Close()
 			break listener
 		}
@@ -150,8 +220,7 @@ listener:
 	return nil
 }
 
-/////////////////////////
-
+//
 func (server *Server) handleConnection(conn net.Conn) {
 	boundDN := "" // "" == anonymous
 
@@ -172,40 +241,46 @@ handler:
 			break
 		}
 		// check the message ID and ClassType
-		messageID := packet.Children[0].Value.(uint64)
+		messageID, ok := packet.Children[0].Value.(uint64)
+		if !ok {
+			log.Print("malformed messageID")
+			break
+		}
 		req := packet.Children[1]
 		if req.ClassType != ber.ClassApplication {
 			log.Print("req.ClassType != ber.ClassApplication")
 			break
 		}
 		// handle controls if present
+		controls := []Control{}
 		if len(packet.Children) > 2 {
-			controls := packet.Children[2]
-			ber.PrintPacket(controls)
-			log.Print("TODO Parse Controls")
-			/*
-			   Controls ::= SEQUENCE OF control Control
-
-			   Control ::= SEQUENCE {
-			        controlType             LDAPOID,
-			        criticality             BOOLEAN DEFAULT FALSE, // unavailableCriticalExtension
-			        controlValue            OCTET STRING OPTIONAL }
-			*/
+			for _, child := range packet.Children[2].Children {
+				controls = append(controls, DecodeControl(child))
+			}
 		}
+
+		//log.Printf("DEBUG: handling operation: %s [%d]", ApplicationMap[req.Tag], req.Tag)
+		//ber.PrintPacket(packet) // DEBUG
 
 		// dispatch the LDAP operation
 		switch req.Tag { // ldap op code
 		default:
-			//log.Printf("Bound as %s", boundDN)
-			//ber.PrintPacket(packet)
-			log.Printf("Unhandled operation: %s [%d]", ApplicationMap[req.Tag], req.Tag)
+			responsePacket := encodeLDAPResponse(messageID, ApplicationAddResponse, LDAPResultOperationsError, "Unsupported operation: add")
+			if err = sendPacket(conn, responsePacket); err != nil {
+				log.Printf("sendPacket error %s", err.Error())
+			}
+			log.Printf("Unhandled operation: %s [%d]", ApplicationMap[uint8(req.Tag)], req.Tag)
 			break handler
 
 		case ApplicationBindRequest:
-			server.stats.countBinds(1)
-			ldapResultCode := server.handleBindRequest(req, server.bindFns, conn)
+			server.Stats.countBinds(1)
+			ldapResultCode := HandleBindRequest(req, server.BindFns, conn)
 			if ldapResultCode == LDAPResultSuccess {
-				boundDN = req.Children[1].Value.(string)
+				boundDN, ok = req.Children[1].Value.(string)
+				if !ok {
+					log.Printf("Malformed Bind DN")
+					break handler
+				}
 			}
 			responsePacket := encodeBindResponse(messageID, ldapResultCode)
 			if err = sendPacket(conn, responsePacket); err != nil {
@@ -213,12 +288,13 @@ handler:
 				break handler
 			}
 		case ApplicationSearchRequest:
-			server.stats.countSearches(1)
-			if err := server.handleSearchRequest(req, messageID, boundDN, server.searchFns, conn); err != nil {
+			server.Stats.countSearches(1)
+			if err := HandleSearchRequest(req, &controls, messageID, boundDN, server, conn); err != nil {
 				log.Printf("handleSearchRequest error %s", err.Error()) // TODO: make this more testable/better err handling - stop using log, stop using breaks?
 				e := err.(*Error)
-				if err = sendPacket(conn, encodeSearchDone(messageID, uint64(e.ResultCode))); err != nil {
+				if err = sendPacket(conn, encodeSearchDone(messageID, e.ResultCode)); err != nil {
 					log.Printf("sendPacket error %s", err.Error())
+					break handler
 				}
 				break handler
 			} else {
@@ -228,181 +304,65 @@ handler:
 				}
 			}
 		case ApplicationUnbindRequest:
-			server.stats.countUnbinds(1)
-			break handler // simply disconnect - this IS implemented
+			server.Stats.countUnbinds(1)
+			break handler // simply disconnect
 		case ApplicationExtendedRequest:
-			responsePacket := encodeLDAPResponse(messageID, ApplicationExtendedResponse, LDAPResultProtocolError, "Unsupported extended request")
+			ldapResultCode := HandleExtendedRequest(req, boundDN, server.ExtendedFns, conn)
+			responsePacket := encodeLDAPResponse(messageID, ApplicationExtendedResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
 			if err = sendPacket(conn, responsePacket); err != nil {
 				log.Printf("sendPacket error %s", err.Error())
+				break handler
 			}
-			break handler
 		case ApplicationAbandonRequest:
-			log.Printf("Abandoning request!")
+			HandleAbandonRequest(req, boundDN, server.AbandonFns, conn)
 			break handler
 
-			// Unimplemented LDAP operations:
-		case ApplicationModifyRequest:
-			log.Printf("Unhandled operation: %s [%d]", ApplicationMap[req.Tag], req.Tag)
-			break handler
 		case ApplicationAddRequest:
-			log.Printf("Unhandled operation: %s [%d]", ApplicationMap[req.Tag], req.Tag)
-			break handler
+			ldapResultCode := HandleAddRequest(req, boundDN, server.AddFns, conn)
+			responsePacket := encodeLDAPResponse(messageID, ApplicationAddResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
+			if err = sendPacket(conn, responsePacket); err != nil {
+				log.Printf("sendPacket error %s", err.Error())
+				break handler
+			}
+		case ApplicationModifyRequest:
+			ldapResultCode := HandleModifyRequest(req, boundDN, server.ModifyFns, conn)
+			responsePacket := encodeLDAPResponse(messageID, ApplicationModifyResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
+			if err = sendPacket(conn, responsePacket); err != nil {
+				log.Printf("sendPacket error %s", err.Error())
+				break handler
+			}
 		case ApplicationDelRequest:
-			log.Printf("Unhandled operation: %s [%d]", ApplicationMap[req.Tag], req.Tag)
-			break handler
+			ldapResultCode := HandleDeleteRequest(req, boundDN, server.DeleteFns, conn)
+			responsePacket := encodeLDAPResponse(messageID, ApplicationDelResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
+			if err = sendPacket(conn, responsePacket); err != nil {
+				log.Printf("sendPacket error %s", err.Error())
+				break handler
+			}
 		case ApplicationModifyDNRequest:
-			log.Printf("Unhandled operation: %s [%d]", ApplicationMap[req.Tag], req.Tag)
-			break handler
+			ldapResultCode := HandleModifyDNRequest(req, boundDN, server.ModifyDNFns, conn)
+			responsePacket := encodeLDAPResponse(messageID, ApplicationModifyDNResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
+			if err = sendPacket(conn, responsePacket); err != nil {
+				log.Printf("sendPacket error %s", err.Error())
+				break handler
+			}
 		case ApplicationCompareRequest:
-			log.Printf("Unhandled operation: %s [%d]", ApplicationMap[req.Tag], req.Tag)
-			break handler
+			ldapResultCode := HandleCompareRequest(req, boundDN, server.CompareFns, conn)
+			responsePacket := encodeLDAPResponse(messageID, ApplicationCompareResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
+			if err = sendPacket(conn, responsePacket); err != nil {
+				log.Printf("sendPacket error %s", err.Error())
+				break handler
+			}
 		}
 	}
 
-	for _, c := range server.closeFns {
-		c.Close(conn)
+	for _, c := range server.CloseFns {
+		c.Close(boundDN, conn)
 	}
 
 	conn.Close()
 }
 
-/////////////////////////
-func (server *Server) handleSearchRequest(req *ber.Packet, messageID uint64, boundDN string, searchFns map[string]Searcher, conn net.Conn) (resultErr error) {
-	defer func() {
-		if r := recover(); r != nil {
-			resultErr = NewError(LDAPResultOperationsError, fmt.Errorf("Search function panic: %s", r))
-		}
-	}()
-
-	searchReq, err := parseSearchRequest(boundDN, req)
-	if err != nil {
-		return NewError(LDAPResultOperationsError, err)
-	}
-
-	filterPacket, err := CompileFilter(searchReq.Filter)
-	if err != nil {
-		return NewError(LDAPResultOperationsError, err)
-	}
-
-	fnNames := []string{}
-	for k := range searchFns {
-		fnNames = append(fnNames, k)
-	}
-	searchFn := routeFunc(searchReq.BaseDN, fnNames)
-	searchResp, err := searchFns[searchFn].Search(boundDN, searchReq, conn)
-	if err != nil {
-		return NewError(uint8(searchResp.ResultCode), err)
-	}
-
-	if server.EnforceLDAP {
-		if searchReq.DerefAliases != NeverDerefAliases { // [-a {never|always|search|find}
-			// TODO: Server DerefAliases not implemented: RFC4511 4.5.1.3.  SearchRequest.derefAliases
-		}
-		if len(searchReq.Controls) > 0 {
-			return NewError(LDAPResultOperationsError, errors.New("Server controls not implemented")) // TODO
-		}
-		if searchReq.TimeLimit > 0 {
-			return NewError(LDAPResultOperationsError, errors.New("Server TimeLimit not implemented")) // TODO
-		}
-	}
-
-	for i, entry := range searchResp.Entries {
-		if server.EnforceLDAP {
-			// size limit
-			if searchReq.SizeLimit > 0 && i >= searchReq.SizeLimit {
-				break
-			}
-
-			// filter
-			keep, resultCode := ServerApplyFilter(filterPacket, entry)
-			if resultCode != LDAPResultSuccess {
-				return NewError(uint8(resultCode), errors.New("ServerApplyFilter error"))
-			}
-			if !keep {
-				continue
-			}
-
-			// constrained search scope
-			switch searchReq.Scope {
-			case ScopeWholeSubtree: // The scope is constrained to the entry named by baseObject and to all its subordinates.
-			case ScopeBaseObject: // The scope is constrained to the entry named by baseObject.
-				if entry.DN != searchReq.BaseDN {
-					continue
-				}
-			case ScopeSingleLevel: // The scope is constrained to the immediate subordinates of the entry named by baseObject.
-				parts := strings.Split(entry.DN, ",")
-				if len(parts) < 2 && entry.DN != searchReq.BaseDN {
-					continue
-				}
-				if dn := strings.Join(parts[1:], ","); dn != searchReq.BaseDN {
-					continue
-				}
-			}
-
-			// attributes
-			if len(searchReq.Attributes) > 1 || (len(searchReq.Attributes) == 1 && len(searchReq.Attributes[0]) > 0) {
-				entry, err = filterAttributes(entry, searchReq.Attributes)
-				if err != nil {
-					return NewError(LDAPResultOperationsError, err)
-				}
-			}
-		}
-
-		// respond
-		responsePacket := encodeSearchResponse(messageID, searchReq, entry)
-		if err = sendPacket(conn, responsePacket); err != nil {
-			return NewError(LDAPResultOperationsError, err)
-		}
-	}
-	return nil
-}
-
-/////////////////////////
-func (server *Server) handleBindRequest(req *ber.Packet, bindFns map[string]Binder, conn net.Conn) (resultCode uint64) {
-	defer func() {
-		if r := recover(); r != nil {
-			resultCode = LDAPResultOperationsError
-		}
-	}()
-
-	// we only support ldapv3
-	ldapVersion := req.Children[0].Value.(uint64)
-	if ldapVersion != 3 {
-		log.Printf("Unsupported LDAP version: %d", ldapVersion)
-		return LDAPResultInappropriateAuthentication
-	}
-
-	// auth types
-	bindDN := req.Children[1].Value.(string)
-	bindAuth := req.Children[2]
-	switch bindAuth.Tag {
-	default:
-		log.Print("Unknown LDAP authentication method")
-		return LDAPResultInappropriateAuthentication
-	case LDAPBindAuthSimple:
-		if len(req.Children) == 3 {
-			fnNames := []string{}
-			for k := range bindFns {
-				fnNames = append(fnNames, k)
-			}
-			bindFn := routeFunc(bindDN, fnNames)
-			resultCode, err := bindFns[bindFn].Bind(bindDN, bindAuth.Data.String(), conn)
-			if err != nil {
-				log.Printf("BindFn Error %s", err.Error())
-			}
-			return resultCode
-		} else {
-			log.Print("Simple bind request has wrong # children.  len(req.Children) != 3")
-			return LDAPResultInappropriateAuthentication
-		}
-	case LDAPBindAuthSASL:
-		log.Print("SASL authentication is not supported")
-		return LDAPResultInappropriateAuthentication
-	}
-	return LDAPResultOperationsError
-}
-
-/////////////////////////
+//
 func sendPacket(conn net.Conn, packet *ber.Packet) error {
 	_, err := conn.Write(packet.Bytes())
 	if err != nil {
@@ -412,38 +372,7 @@ func sendPacket(conn net.Conn, packet *ber.Packet) error {
 	return nil
 }
 
-/////////////////////////
-func parseSearchRequest(boundDN string, req *ber.Packet) (SearchRequest, error) {
-	if len(req.Children) != 8 {
-		return SearchRequest{}, NewError(LDAPResultOperationsError, errors.New("Bad search request"))
-	}
-
-	// Parse the request
-	baseObject := req.Children[0].Value.(string)
-	scope := int(req.Children[1].Value.(uint64))
-	derefAliases := int(req.Children[2].Value.(uint64))
-	sizeLimit := int(req.Children[3].Value.(uint64))
-	timeLimit := int(req.Children[4].Value.(uint64))
-	typesOnly := false
-	if req.Children[5].Value != nil {
-		typesOnly = req.Children[5].Value.(bool)
-	}
-	filter, err := DecompileFilter(req.Children[6])
-	if err != nil {
-		return SearchRequest{}, err
-	}
-	attributes := []string{}
-	for _, attr := range req.Children[7].Children {
-		attributes = append(attributes, attr.Value.(string))
-	}
-	searchReq := SearchRequest{baseObject, scope,
-		derefAliases, sizeLimit, timeLimit,
-		typesOnly, filter, attributes, nil}
-
-	return searchReq, nil
-}
-
-/////////////////////////
+//
 func routeFunc(dn string, funcNames []string) string {
 	bestPick := ""
 	for _, fn := range funcNames {
@@ -460,109 +389,58 @@ func routeFunc(dn string, funcNames []string) string {
 	return bestPick
 }
 
-/////////////////////////
-func filterAttributes(entry *Entry, attributes []string) (*Entry, error) {
-	// only return requested attributes
-	newAttributes := []*EntryAttribute{}
-
-	for _, attr := range entry.Attributes {
-		for _, requested := range attributes {
-			if strings.ToLower(attr.Name) == strings.ToLower(requested) {
-				newAttributes = append(newAttributes, attr)
-			}
-		}
-	}
-	entry.Attributes = newAttributes
-
-	return entry, nil
-}
-
-/////////////////////////
-type defaultHandler struct {
-}
-
-func (h defaultHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (uint64, error) {
-	return LDAPResultInappropriateAuthentication, nil
-}
-func (h defaultHandler) Search(boundDN string, searchReq SearchRequest, conn net.Conn) (ServerSearchResult, error) {
-	return ServerSearchResult{make([]*Entry, 0), []string{}, []Control{}, LDAPResultSuccess}, nil
-}
-func (h defaultHandler) Close(conn net.Conn) error {
-	conn.Close()
-	return nil
-}
-
-/////////////////////////
-func encodeBindResponse(messageID uint64, ldapResultCode uint64) *ber.Packet {
+// TODO - reindent this
+func encodeLDAPResponse(messageID uint64, responseType uint8, ldapResultCode LDAPResultCode, message string) *ber.Packet {
 	responsePacket := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Response")
 	responsePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, messageID, "Message ID"))
-
-	bindReponse := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationBindResponse, nil, "Bind Response")
-	bindReponse.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, ldapResultCode, "resultCode: "))
-	bindReponse.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "matchedDN: "))
-	bindReponse.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "errorMessage: "))
-
-	responsePacket.AppendChild(bindReponse)
-
-	// ber.PrintPacket(responsePacket)
-	return responsePacket
-}
-func encodeSearchResponse(messageID uint64, req SearchRequest, res *Entry) *ber.Packet {
-	responsePacket := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Response")
-	responsePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, messageID, "Message ID"))
-
-	searchEntry := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationSearchResultEntry, nil, "Search Result Entry")
-	searchEntry.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, res.DN, "Object Name"))
-
-	attrs := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "Attributes:")
-	for _, attribute := range res.Attributes {
-		attrs.AppendChild(encodeSearchAttribute(attribute.Name, attribute.Values))
-	}
-
-	searchEntry.AppendChild(attrs)
-	responsePacket.AppendChild(searchEntry)
-
-	return responsePacket
-}
-
-func encodeSearchAttribute(name string, values []string) *ber.Packet {
-	packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "Attribute")
-	packet.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, name, "Attribute Name"))
-
-	valuesPacket := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSet, nil, "Attribute Values")
-	for _, value := range values {
-		valuesPacket.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, value, "Attribute Value"))
-	}
-
-	packet.AppendChild(valuesPacket)
-
-	return packet
-}
-
-func encodeSearchDone(messageID uint64, ldapResultCode uint64) *ber.Packet {
-	responsePacket := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Response")
-	responsePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, messageID, "Message ID"))
-	donePacket := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationSearchResultDone, nil, "Search result done")
-	donePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, ldapResultCode, "resultCode: "))
-	donePacket.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "matchedDN: "))
-	donePacket.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "errorMessage: "))
-	responsePacket.AppendChild(donePacket)
-
-	return responsePacket
-}
-
-func encodeLDAPResponse(messageID uint64, responseType uint8, ldapResultCode uint64, message string) *ber.Packet {
-	responsePacket := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Response")
-	responsePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, messageID, "Message ID"))
-	reponse := ber.Encode(ber.ClassApplication, ber.TypeConstructed, responseType, nil, ApplicationMap[responseType])
-	reponse.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, ldapResultCode, "resultCode: "))
+	reponse := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ber.Tag(responseType), nil, ApplicationMap[uint8(responseType)])
+	reponse.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, uint64(ldapResultCode), "resultCode: "))
 	reponse.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "matchedDN: "))
 	reponse.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, message, "errorMessage: "))
 	responsePacket.AppendChild(reponse)
 	return responsePacket
 }
 
-/////////////////////////
+//
+type defaultHandler struct {
+}
+
+func (h defaultHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (LDAPResultCode, error) {
+	return LDAPResultInvalidCredentials, nil
+}
+func (h defaultHandler) Search(boundDN string, req SearchRequest, conn net.Conn) (ServerSearchResult, error) {
+	return ServerSearchResult{make([]*Entry, 0), []string{}, []Control{}, LDAPResultSuccess}, nil
+}
+func (h defaultHandler) Add(boundDN string, req AddRequest, conn net.Conn) (LDAPResultCode, error) {
+	return LDAPResultInsufficientAccessRights, nil
+}
+func (h defaultHandler) Modify(boundDN string, req ModifyRequest, conn net.Conn) (LDAPResultCode, error) {
+	return LDAPResultInsufficientAccessRights, nil
+}
+func (h defaultHandler) Delete(boundDN, deleteDN string, conn net.Conn) (LDAPResultCode, error) {
+	return LDAPResultInsufficientAccessRights, nil
+}
+func (h defaultHandler) ModifyDN(boundDN string, req ModifyDNRequest, conn net.Conn) (LDAPResultCode, error) {
+	return LDAPResultInsufficientAccessRights, nil
+}
+func (h defaultHandler) Compare(boundDN string, req CompareRequest, conn net.Conn) (LDAPResultCode, error) {
+	return LDAPResultInsufficientAccessRights, nil
+}
+func (h defaultHandler) Abandon(boundDN string, conn net.Conn) error {
+	return nil
+}
+func (h defaultHandler) Extended(boundDN string, req ExtendedRequest, conn net.Conn) (LDAPResultCode, error) {
+	return LDAPResultProtocolError, nil
+}
+func (h defaultHandler) Unbind(boundDN string, conn net.Conn) (LDAPResultCode, error) {
+	return LDAPResultSuccess, nil
+}
+func (h defaultHandler) Close(boundDN string, conn net.Conn) error {
+	conn.Close()
+	return nil
+}
+
+//
 func (stats *Stats) countConns(delta int) {
 	if stats != nil {
 		stats.statsMutex.Lock()
@@ -592,4 +470,4 @@ func (stats *Stats) countSearches(delta int) {
 	}
 }
 
-/////////////////////////
+//

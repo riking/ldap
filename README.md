@@ -110,7 +110,7 @@ searchResults, err := l.Search(search)
 The server library is modeled after net/http - you designate handlers for the LDAP operations you want to support (Bind/Search/etc.), then start the server with ListenAndServe().  You can specify different handlers for different baseDNs - they must implement the interfaces of the operations you want to support:
 ```go
 type Binder interface {
-    Bind(bindDN, bindSimplePw string, conn net.Conn) (uint64, error)
+    Bind(bindDN, bindSimplePw string, conn net.Conn) (LDAPResultCode, error)
 }
 type Searcher interface {
     Search(boundDN string, searchReq SearchRequest, conn net.Conn) (ServerSearchResult, error)
@@ -132,7 +132,7 @@ func main() {
 }
 type ldapHandler struct {
 }
-func (h ldapHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (uint64, error) {
+func (h ldapHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (ldap.LDAPResultCode, error) {
 	if bindDN == "" && bindSimplePw == "" {
 		return ldap.LDAPResultSuccess, nil
 	}
@@ -145,25 +145,17 @@ func (h ldapHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (uint64, e
 ### LDAP server examples:
 * examples/server.go: **Basic LDAP authentication (bind and search only)**
 * examples/proxy.go: **Simple LDAP proxy server.**
-* server_test: **The tests have examples of all server functions.**
-
-*Warning: Do not use the example SSL certificates in production!*
+* server_test.go: **The _test.go files have examples of all server functions.**
 
 ### Known limitations:
 
 * Golang's TLS implementation does not support SSLv2.  Some old OSs require SSLv2, and are not able to connect to an LDAP server created with this library's ListenAndServeTLS() function.  If you *must* support legacy (read: *insecure*) SSLv2 clients, run your LDAP server behind HAProxy.
 
 ### Not implemented:
-All of [RFC4510](http://tools.ietf.org/html/rfc4510) is implemented **except**:
-* 4.1.11.  Controls
+From the server perspective, all of [RFC4510](http://tools.ietf.org/html/rfc4510) is implemented **except**:
 * 4.5.1.3.  SearchRequest.derefAliases
 * 4.5.1.5.  SearchRequest.timeLimit
 * 4.5.1.6.  SearchRequest.typesOnly
-* 4.6. Modify Operation
-* 4.7. Add Operation
-* 4.8. Delete Operation
-* 4.9. Modify DN Operation
-* 4.10. Compare Operation
 * 4.14. StartTLS Operation
 
 *Server library by: [nmcclain](https://github.com/nmcclain)*

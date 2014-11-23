@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/nmcclain/asn1-ber"
 	"gopkg.in/asn1-ber.v1"
 )
 

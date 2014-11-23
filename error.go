@@ -58,7 +58,7 @@ const (
 )
 
 // LDAPResultCodeMap contains string descriptions for LDAP error codes
-var LDAPResultCodeMap = map[uint8]string{
+var LDAPResultCodeMap = map[LDAPResultCode]string{
 	LDAPResultSuccess:                      "Success",
 	LDAPResultOperationsError:              "Operations Error",
 	LDAPResultProtocolError:                "Protocol Error",
@@ -108,7 +108,7 @@ var LDAPResultCodeMap = map[uint8]string{
 	ErrorEmptyPassword:      "Empty password not allowed by the client",
 }
 
-func getLDAPResultCode(packet *ber.Packet) (code uint8, description string) {
+func getLDAPResultCode(packet *ber.Packet) (code LDAPResultCode, description string) {
 	if packet == nil {
 		return ErrorUnexpectedResponse, "Empty packet"
 	} else if len(packet.Children) >= 2 {
@@ -118,7 +118,7 @@ func getLDAPResultCode(packet *ber.Packet) (code uint8, description string) {
 		}
 		if response.ClassType == ber.ClassApplication && response.TagType == ber.TypeConstructed && len(response.Children) >= 3 {
 			// Children[1].Children[2] is the diagnosticMessage which is guaranteed to exist as seen here: https://tools.ietf.org/html/rfc4511#section-4.1.9
-			return uint8(response.Children[0].Value.(int64)), response.Children[2].Value.(string)
+			return LDAPResultCode(response.Children[0].Value.(int64)), response.Children[2].Value.(string)
 		}
 	}
 
@@ -130,7 +130,7 @@ type Error struct {
 	// Err is the underlying error
 	Err error
 	// ResultCode is the LDAP error code
-	ResultCode uint8
+	ResultCode LDAPResultCode
 }
 
 func (e *Error) Error() string {
@@ -138,12 +138,12 @@ func (e *Error) Error() string {
 }
 
 // NewError creates an LDAP error with the given code and underlying error
-func NewError(resultCode uint8, err error) error {
+func NewError(resultCode LDAPResultCode, err error) error {
 	return &Error{ResultCode: resultCode, Err: err}
 }
 
 // IsErrorWithCode returns true if the given error is an LDAP error with the given result code
-func IsErrorWithCode(err error, desiredResultCode uint8) bool {
+func IsErrorWithCode(err error, desiredResultCode LDAPResultCode) bool {
 	if err == nil {
 		return false
 	}

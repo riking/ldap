@@ -88,6 +88,30 @@ const (
 	LDAPBindAuthSASL   = 3
 )
 
+type LDAPResultCode uint8
+
+type DeleteRequest struct {
+	dn string
+}
+type ModifyDNRequest struct {
+	dn           string
+	newrdn       string
+	deleteoldrdn bool
+	newSuperior  string
+}
+type AttributeValueAssertion struct {
+	attributeDesc  string
+	assertionValue string
+}
+type CompareRequest struct {
+	dn  string
+	ava []AttributeValueAssertion
+}
+type ExtendedRequest struct {
+	requestName  string
+	requestValue string
+}
+
 // Adds descriptions to an LDAP Response packet for debugging
 func addLDAPDescriptions(packet *ber.Packet) (err error) {
 	defer func() {

@@ -43,6 +43,12 @@ const (
 	ReplaceAttribute = 2
 )
 
+var LDAPModifyAttributeMap = map[uint64]string{
+	AddAttribute:     "Add",
+	DeleteAttribute:  "Delete",
+	ReplaceAttribute: "Replace",
+}
+
 // PartialAttribute for a ModifyRequest as defined in https://tools.ietf.org/html/rfc4511
 type PartialAttribute struct {
 	// Type is the type of the partial attribute
