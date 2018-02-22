@@ -417,6 +417,9 @@ func (server *Server) handleConnection(conn net.Conn) {
 	// TODO - make a clientconn struct
 	boundDN := "" // "" == anonymous
 
+	ctx, cancel := context.WithCancel(server.ctx)
+	defer cancel()
+
 handler:
 	for {
 		// read incoming LDAP packet
