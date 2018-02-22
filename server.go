@@ -3,6 +3,7 @@ package ldap
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -16,12 +17,12 @@ import (
 
 // Recieves notifications of all requests.
 type PacketHandler interface {
-	OnPacket(boundDN string, packet *ber.Packet, conn net.Conn) (LDAPResultCode, error)
+	OnPacket(boundDN string, packet *ber.Packet, conn net.Conn)
 }
 
 // Recieves notifications when a connection is closed.
 type CloseHandler interface {
-	OnClose(boundDN string, conn net.Conn) error
+	OnClose(boundDN string, conn net.Conn)
 }
 
 // Handles ApplicationBindRequest (0) requests.
@@ -29,9 +30,14 @@ type BindHandler interface {
 	Bind(bindDN, bindSimplePw string, conn net.Conn) (LDAPResultCode, error)
 }
 
+type BindSASLHandler interface {
+	BindHandler
+	BindSASL(bindDN, mechanism, credentials string, conn net.Conn) (res LDAPResultCode, err error)
+}
+
 // Handles ApplicationUnbindRequest (2) requests.
 type UnbindHandler interface {
-	Unbind(boundDN string, conn net.Conn) (LDAPResultCode, error)
+	Unbind(boundDN string, conn net.Conn)
 }
 
 // Handles ApplicationSearchRequest (3) requests.
@@ -65,7 +71,7 @@ type CompareHandler interface {
 }
 
 // Handles ApplicationAbandonRequest (16) requests.
-// TODO - this should be using context.Context
+// TODO - this should be done by the server using context.Context
 type AbandonHandler interface {
 	Abandon(boundDN string, conn net.Conn) error
 }
@@ -73,6 +79,17 @@ type AbandonHandler interface {
 // Handles ApplicationExtendedRequest (23) requests.
 type ExtendedHandler interface {
 	Extended(boundDN string, req ExtendedRequest, conn net.Conn) (LDAPResultCode, error)
+}
+
+type ResponseWriter interface {
+	SendPacket(packet *ber.Packet)
+	SendResult(respType uint8, resultCode LDAPResultCode, errMessage string)
+	SendReferral(respType uint8, referTo []string, errMessage string)
+	SendSASLBindResult(resultCode LDAPResultCode, serverCreds string, errMessage string)
+
+	GetBoundDN() string
+	SetMatchedDN(matchedDN string)
+	Err() error
 }
 
 const (
@@ -196,6 +213,13 @@ func (server *Server) HandleRequest(baseDN string, f interface{}) {
 	}
 }
 
+// Get the handler map for a given request type.
+//
+// this function is dirty: callers can do bad things with it
+func (server *Server) GetHandlers(reqCode uint16) map[string]interface{} {
+	return server.Handlers[reqCode]
+}
+
 // Return the Context that will terminate when the server closes.
 func (server *Server) Context() context.Context {
 	return server.ctx
@@ -230,6 +254,7 @@ func (server *Server) ListenAndServe(listenString string) error {
 	return server.serve(ln)
 }
 
+// Note: you will need to use this function if you need a custom tls.Config
 func (server *Server) Serve(ln net.Listener) error {
 	return server.serve(ln)
 }
@@ -250,7 +275,7 @@ func (server *Server) serve(ln net.Listener) error {
 			if err != nil {
 				server.closeErr = err
 				log.Printf("Error accepting network connection: %s", err.Error())
-				server.ctxClose()
+				server.ctxCancel()
 				break
 			}
 			newConn <- conn
@@ -287,8 +312,109 @@ func (server *Server) GetStats() Stats {
 	return *server.Stats
 }
 
+const (
+	TagLDAPDN     = ber.TagOctetString
+	TagLDAPString = ber.TagOctetString
+)
+
+type responseWriter struct {
+	conn      net.Conn
+	writeErr  error
+	boundDN   string
+	matchDN   string
+	messageID uint64
+
+	hasWrittenResponse bool
+}
+
+func (w *responseWriter) basicLDAPResult(respType uint8, resultCode LDAPResultCode, errMessage string) *ber.Packet {
+	// 4.1.10 LDAPResult
+	response := ber.Encode(ber.ClassApplication, ber.TypeConstructed,
+		ber.Tag(respType), nil, ApplicationMap[respType],
+	)
+	response.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive,
+		ber.TagEnumerated, uint64(resultCode), "resultCode",
+	))
+	response.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive,
+		TagLDAPDN, w.matchDN, "matchedDN",
+	))
+	response.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive,
+		TagLDAPString, errMessage, "errMessage",
+	))
+	return response
+}
+
+func (w *responseWriter) SendResult(respType uint8, resultCode LDAPResultCode, errMessage string) {
+	packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed,
+		ber.TagSequence, nil, "LDAP Response",
+	)
+	packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive,
+		ber.TagInteger, w.messageID, "msg ID",
+	))
+
+	response := w.basicLDAPResult(respType, resultCode, errMessage)
+	packet.AppendChild(response)
+	return w.SendPacket(packet)
+}
+
+func (w *responseWriter) SendReferral(respType uint8, referTo []string, errMessage string) {
+	packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed,
+		ber.TagSequence, nil, "LDAP Response",
+	)
+	packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive,
+		ber.TagInteger, w.messageID, "msg ID",
+	))
+
+	response := w.basicLDAPResult(respType, LDAPResultReferral, errMessage)
+	referral := ber.Encode(ber.ClassApplication, ber.TypeConstructed,
+		ber.Tag(3), nil, "[3] Referral: SEQUENCE OF LDAPURL",
+	)
+	for _, v := range referTo {
+		response.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive,
+			TagLDAPString, v, "",
+		))
+	}
+
+	response.AppendChild(referral)
+	packet.AppendChild(response)
+	return w.SendPacket(packet)
+}
+
+func (w *responseWriter) SendSASLBindResult(resultCode LDAPResultCode, serverCreds string, errMessage string) {
+	packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed,
+		ber.TagSequence, nil, "LDAP Response",
+	)
+	packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive,
+		ber.TagInteger, w.messageID, "msg ID",
+	))
+
+	response := w.basicLDAPResult(ApplicationBindResponse, LDAPResultReferral, errMessage)
+	creds := ber.Encode(ber.ClassApplication, ber.TypeConstructed,
+		ber.Tag(7), nil, "serverSaslCreds [7] OCTET STRING OPTIONAL",
+	)
+	creds.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive,
+		ber.TagOctetString, serverCreds, "serverSaslCreds",
+	))
+
+	response.AppendChild(creds)
+	packet.AppendChild(response)
+	return w.SendPacket(packet)
+}
+
 //
 func (server *Server) handleConnection(conn net.Conn) {
+	defer func() {
+		if rec := recover(); r != nil {
+			// we use pkg/errors to print a stacktrace
+			if recErr, ok := rec.(error); ok {
+				fmt.Fprintf(os.Stderr, "ldap: %+v\n", errors.Wrap(recError, "error in handleConnection"))
+			} else {
+				fmt.Fprintf(os.Stderr, "ldap: %+v\n", errors.Errorf("panic in handleConnection: %#v", rec))
+			}
+		}
+	}()
+
+	// TODO - make a clientconn struct
 	boundDN := "" // "" == anonymous
 
 handler:
@@ -330,9 +456,23 @@ handler:
 		//ber.PrintPacket(packet) // DEBUG
 
 		// dispatch the LDAP operation
+
+		// casting to uint8 first so clients can't select the Special handlers
+		handlerFn := routeFunc(boundDN, server.Handlers[uint16(uint8(req.Tag))])
+
+		for _, fn := range server.Handlers[ApplicationSpecialOnPacket] {
+			fn.(PacketHandler).OnPacket(boundDN, packet, conn)
+		}
+
+		w := responseWriter{
+			conn:      conn,
+			boundDN:   boundDN,
+			messageID: messageID,
+		}
+
 		switch req.Tag { // ldap op code
 		default:
-			responsePacket := encodeLDAPResponse(messageID, ApplicationAddResponse, LDAPResultOperationsError, "Unsupported operation: add")
+			responsePacket := encodeLDAPResponse(messageID, ApplicationAddResponse, LDAPResultOperationsError, fmt.Sprintf("Unsupported operation: %v", req.Tag))
 			if err = sendPacket(conn, responsePacket); err != nil {
 				log.Printf("sendPacket error %s", err.Error())
 			}
@@ -341,18 +481,14 @@ handler:
 
 		case ApplicationBindRequest:
 			server.Stats.countBinds(1)
-			ldapResultCode := HandleBindRequest(req, server.BindFns, conn)
+			ldapResultCode, saslExtra, err := HandleBindRequest(req, handlerFn.(BindHandler), conn)
 			if ldapResultCode == LDAPResultSuccess {
-				boundDN, ok = req.Children[1].Value.(string)
-				if !ok {
-					log.Printf("Malformed Bind DN")
-					break handler
-				}
+				boundDN = req.Children[1].Value.(string)
 			}
-			responsePacket := encodeBindResponse(messageID, ldapResultCode)
-			if err = sendPacket(conn, responsePacket); err != nil {
-				log.Printf("sendPacket error %s", err.Error())
-				break handler
+			if err != nil {
+				w.SendResult(ApplicationBindResponse, ldapResultCode, err.Error())
+			} else if !w.hasWrittenResponse {
+				w.SendResult(ApplicationBindResponse, ldapResultCode, "")
 			}
 		case ApplicationSearchRequest:
 			server.Stats.countSearches(1)
@@ -373,48 +509,49 @@ handler:
 		case ApplicationUnbindRequest:
 			// TODO - call unbind handler
 			server.Stats.countUnbinds(1)
+			handlerFn.(UnbindHandler).Unbind(boundDN, conn)
 			break handler // simply disconnect
 		case ApplicationExtendedRequest:
-			ldapResultCode := HandleExtendedRequest(req, boundDN, server.ExtendedFns, conn)
+			ldapResultCode := HandleExtendedRequest(req, boundDN, handlerFn.(ExtendedHandler), conn)
 			responsePacket := encodeLDAPResponse(messageID, ApplicationExtendedResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
 			if err = sendPacket(conn, responsePacket); err != nil {
 				log.Printf("sendPacket error %s", err.Error())
 				break handler
 			}
 		case ApplicationAbandonRequest:
-			HandleAbandonRequest(req, boundDN, server.AbandonFns, conn)
+			HandleAbandonRequest(req, boundDN, handlerFn.(AbandonHandler), conn)
 			break handler
 
 		case ApplicationAddRequest:
-			ldapResultCode := HandleAddRequest(req, boundDN, server.AddFns, conn)
+			ldapResultCode := HandleAddRequest(req, boundDN, handlerFn.(AddHandler), conn)
 			responsePacket := encodeLDAPResponse(messageID, ApplicationAddResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
 			if err = sendPacket(conn, responsePacket); err != nil {
 				log.Printf("sendPacket error %s", err.Error())
 				break handler
 			}
 		case ApplicationModifyRequest:
-			ldapResultCode := HandleModifyRequest(req, boundDN, server.ModifyFns, conn)
+			ldapResultCode := HandleModifyRequest(req, boundDN, handlerFn.(ModifyHandler), conn)
 			responsePacket := encodeLDAPResponse(messageID, ApplicationModifyResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
 			if err = sendPacket(conn, responsePacket); err != nil {
 				log.Printf("sendPacket error %s", err.Error())
 				break handler
 			}
 		case ApplicationDelRequest:
-			ldapResultCode := HandleDeleteRequest(req, boundDN, server.DeleteFns, conn)
+			ldapResultCode := HandleDeleteRequest(req, boundDN, handlerFn.(DeleteHandler), conn)
 			responsePacket := encodeLDAPResponse(messageID, ApplicationDelResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
 			if err = sendPacket(conn, responsePacket); err != nil {
 				log.Printf("sendPacket error %s", err.Error())
 				break handler
 			}
 		case ApplicationModifyDNRequest:
-			ldapResultCode := HandleModifyDNRequest(req, boundDN, server.ModifyDNFns, conn)
+			ldapResultCode := HandleModifyDNRequest(req, boundDN, handlerFn.(ModifyDNHandler), conn)
 			responsePacket := encodeLDAPResponse(messageID, ApplicationModifyDNResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
 			if err = sendPacket(conn, responsePacket); err != nil {
 				log.Printf("sendPacket error %s", err.Error())
 				break handler
 			}
 		case ApplicationCompareRequest:
-			ldapResultCode := HandleCompareRequest(req, boundDN, server.CompareFns, conn)
+			ldapResultCode := HandleCompareRequest(req, boundDN, handlerFn.(CompareHandler), conn)
 			responsePacket := encodeLDAPResponse(messageID, ApplicationCompareResponse, ldapResultCode, LDAPResultCodeMap[ldapResultCode])
 			if err = sendPacket(conn, responsePacket); err != nil {
 				log.Printf("sendPacket error %s", err.Error())
@@ -422,9 +559,6 @@ handler:
 			}
 		}
 	}
-
-	unbindH := routeFunc(boundDN, server.Handlers[ApplicationUnbindRequest])
-	unbindH.(UnbindHandler).Unbind(boundDN, conn)
 
 	for _, h := range server.Handlers[ApplicationSpecialOnClose] {
 		h.(CloseHandler).OnClose(boundDN, conn)
@@ -447,10 +581,10 @@ func sendPacket(conn net.Conn, packet *ber.Packet) error {
 func routeFunc(dn string, handlers handlerMap) interface{} {
 	bestDN := ""
 	var bestHandler interface{} = nil
-	for handlerDN, h := range funcNames {
+	for handlerDN, h := range handlers {
 		if strings.HasSuffix(dn, handlerDN) {
 			l := strings.Count(bestDN, ",")
-			if bestPick == "" {
+			if bestDN == "" {
 				l = 0
 			}
 			if strings.Count(handlerDN, ",") > l || bestHandler == nil {

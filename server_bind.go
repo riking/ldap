@@ -7,7 +7,7 @@ import (
 	"gopkg.in/asn1-ber.v1"
 )
 
-func HandleBindRequest(req *ber.Packet, fns map[string]Binder, conn net.Conn) (resultCode LDAPResultCode) {
+func HandleBindRequest(req *ber.Packet, fn BindHandler, conn net.Conn) (resultCode LDAPResultCode, done bool, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			resultCode = LDAPResultOperationsError
@@ -17,17 +17,17 @@ func HandleBindRequest(req *ber.Packet, fns map[string]Binder, conn net.Conn) (r
 	// we only support ldapv3
 	ldapVersion, ok := req.Children[0].Value.(uint64)
 	if !ok {
-		return LDAPResultProtocolError
+		return LDAPResultProtocolError, false, nil
 	}
 	if ldapVersion != 3 {
 		log.Printf("Unsupported LDAP version: %d", ldapVersion)
-		return LDAPResultInappropriateAuthentication
+		return LDAPResultInappropriateAuthentication, false, nil
 	}
 
 	// auth types
 	bindDN, ok := req.Children[1].Value.(string)
 	if !ok {
-		return LDAPResultProtocolError
+		return LDAPResultProtocolError, false, nil
 	}
 	bindAuth := req.Children[2]
 	switch bindAuth.Tag {
@@ -36,26 +36,30 @@ func HandleBindRequest(req *ber.Packet, fns map[string]Binder, conn net.Conn) (r
 		return LDAPResultInappropriateAuthentication
 	case LDAPBindAuthSimple:
 		if len(req.Children) == 3 {
-			fnNames := []string{}
-			for k := range fns {
-				fnNames = append(fnNames, k)
-			}
-			fn := routeFunc(bindDN, fnNames)
-			resultCode, err := fns[fn].Bind(bindDN, bindAuth.Data.String(), conn)
+			resultCode, err := fn.Bind(bindDN, bindAuth.Data.String(), conn)
 			if err != nil {
-				log.Printf("BindFn Error %s", err.Error())
-				return LDAPResultOperationsError
+				return LDAPResultOperationsError, false, err
 			}
-			return resultCode
+			return resultCode, true, nil
 		} else {
-			log.Print("Simple bind request has wrong # children.  len(req.Children) != 3")
-			return LDAPResultInappropriateAuthentication
+			return LDAPResultInappropriateAuthentication, false, nil
 		}
 	case LDAPBindAuthSASL:
-		log.Print("SASL authentication is not supported")
-		return LDAPResultInappropriateAuthentication
+		saslFn, ok := fn.(BindSASLHandler)
+		if !ok {
+			return LDAPResultInappropriateAuthentication, false, nil
+		}
+		var resultCode LDAPResultCode
+		var isDone bool
+		var err error
+		if len(req.Children) == 3 {
+			resultCode, isDone, err = fn.BindSASL(bindDN, req.Children[2].Data.String(), "", conn)
+		} else if len(req.Children) == 4 {
+			resultCode, isDone, err = fn.BindSASL(bindDN, req.Children[2].Data.String(), req.Children[3].Data.String(), conn)
+		}
+		return resultCode, isDone, err
 	}
-	return LDAPResultOperationsError
+	return LDAPResultOperationsError, false, nil
 }
 
 func encodeBindResponse(messageID uint64, ldapResultCode LDAPResultCode) *ber.Packet {
