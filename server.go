@@ -1,65 +1,110 @@
 package ldap
 
 import (
+	"context"
 	"crypto/tls"
-	"gopkg.in/asn1-ber.v1"
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/pkg/errors"
+	"gopkg.in/asn1-ber.v1"
 )
 
-type Binder interface {
-	Bind(bindDN, bindSimplePw string, conn net.Conn) (LDAPResultCode, error)
-}
-type Searcher interface {
-	Search(boundDN string, req SearchRequest, conn net.Conn) (ServerSearchResult, error)
-}
-type Adder interface {
-	Add(boundDN string, req AddRequest, conn net.Conn) (LDAPResultCode, error)
-}
-type Modifier interface {
-	Modify(boundDN string, req ModifyRequest, conn net.Conn) (LDAPResultCode, error)
-}
-type Deleter interface {
-	Delete(boundDN, deleteDN string, conn net.Conn) (LDAPResultCode, error)
-}
-type ModifyDNr interface {
-	ModifyDN(boundDN string, req ModifyDNRequest, conn net.Conn) (LDAPResultCode, error)
-}
-type Comparer interface {
-	Compare(boundDN string, req CompareRequest, conn net.Conn) (LDAPResultCode, error)
-}
-type Abandoner interface {
-	Abandon(boundDN string, conn net.Conn) error
-}
-type Extender interface {
-	Extended(boundDN string, req ExtendedRequest, conn net.Conn) (LDAPResultCode, error)
-}
-type Unbinder interface {
-	Unbind(boundDN string, conn net.Conn) (LDAPResultCode, error)
-}
-type Closer interface {
-	Close(boundDN string, conn net.Conn) error
+// Recieves notifications of all requests.
+type PacketHandler interface {
+	OnPacket(boundDN string, packet *ber.Packet, conn net.Conn) (LDAPResultCode, error)
 }
 
-//
+// Recieves notifications when a connection is closed.
+type CloseHandler interface {
+	OnClose(boundDN string, conn net.Conn) error
+}
+
+// Handles ApplicationBindRequest (0) requests.
+type BindHandler interface {
+	Bind(bindDN, bindSimplePw string, conn net.Conn) (LDAPResultCode, error)
+}
+
+// Handles ApplicationUnbindRequest (2) requests.
+type UnbindHandler interface {
+	Unbind(boundDN string, conn net.Conn) (LDAPResultCode, error)
+}
+
+// Handles ApplicationSearchRequest (3) requests.
+type SearchHandler interface {
+	Search(boundDN string, req SearchRequest, conn net.Conn) (ServerSearchResult, error)
+}
+
+// Handles ApplicationModifyRequest (7) requests.
+type ModifyHandler interface {
+	Modify(boundDN string, req ModifyRequest, conn net.Conn) (LDAPResultCode, error)
+}
+
+// Handles ApplicationAddRequest (8) requests.
+type AddHandler interface {
+	Add(boundDN string, req AddRequest, conn net.Conn) (LDAPResultCode, error)
+}
+
+// Handles ApplicationDeleteRequest (10) requests.
+type DeleteHandler interface {
+	Delete(boundDN, deleteDN string, conn net.Conn) (LDAPResultCode, error)
+}
+
+// Handles ApplicationModifyDNRequest (12) requests.
+type ModifyDNHandler interface {
+	ModifyDN(boundDN string, req ModifyDNRequest, conn net.Conn) (LDAPResultCode, error)
+}
+
+// Handles ApplicationCompareRequest (14) requests.
+type CompareHandler interface {
+	Compare(boundDN string, req CompareRequest, conn net.Conn) (LDAPResultCode, error)
+}
+
+// Handles ApplicationAbandonRequest (16) requests.
+// TODO - this should be using context.Context
+type AbandonHandler interface {
+	Abandon(boundDN string, conn net.Conn) error
+}
+
+// Handles ApplicationExtendedRequest (23) requests.
+type ExtendedHandler interface {
+	Extended(boundDN string, req ExtendedRequest, conn net.Conn) (LDAPResultCode, error)
+}
+
+const (
+	ApplicationSpecialOnPacket = 256 + 0
+	ApplicationSpecialOnClose  = 256 + 1
+)
+
+var validRequestIDs = [...]uint16{ApplicationBindRequest,
+	ApplicationUnbindRequest,
+	ApplicationSearchRequest,
+	ApplicationModifyRequest,
+	ApplicationAddRequest,
+	ApplicationDelRequest,
+	ApplicationModifyDNRequest,
+	ApplicationCompareRequest,
+	ApplicationAbandonRequest,
+	ApplicationExtendedRequest,
+	ApplicationSpecialOnPacket,
+	ApplicationSpecialOnClose,
+}
+
+// The handlerMap maps from Distinguished Name prefixes to the above interfaces.
+type handlerMap map[string]interface{}
+
 type Server struct {
-	BindFns     map[string]Binder
-	SearchFns   map[string]Searcher
-	AddFns      map[string]Adder
-	ModifyFns   map[string]Modifier
-	DeleteFns   map[string]Deleter
-	ModifyDNFns map[string]ModifyDNr
-	CompareFns  map[string]Comparer
-	AbandonFns  map[string]Abandoner
-	ExtendedFns map[string]Extender
-	UnbindFns   map[string]Unbinder
-	CloseFns    map[string]Closer
-	Quit        chan bool
+	Handlers    map[uint16]handlerMap
+	ctx         context.Context
+	ctxCancel   func()
 	EnforceLDAP bool
 	Stats       *Stats
+
+	closeErr error
 }
 
 type Stats struct {
@@ -77,72 +122,90 @@ type ServerSearchResult struct {
 	ResultCode LDAPResultCode
 }
 
-//
 func NewServer() *Server {
 	s := new(Server)
-	s.Quit = make(chan bool)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.ctx = ctx
+	s.ctxCancel = cancel
 
-	d := defaultHandler{}
-	s.BindFns = make(map[string]Binder)
-	s.SearchFns = make(map[string]Searcher)
-	s.AddFns = make(map[string]Adder)
-	s.ModifyFns = make(map[string]Modifier)
-	s.DeleteFns = make(map[string]Deleter)
-	s.ModifyDNFns = make(map[string]ModifyDNr)
-	s.CompareFns = make(map[string]Comparer)
-	s.AbandonFns = make(map[string]Abandoner)
-	s.ExtendedFns = make(map[string]Extender)
-	s.UnbindFns = make(map[string]Unbinder)
-	s.CloseFns = make(map[string]Closer)
-	s.BindFunc("", d)
-	s.SearchFunc("", d)
-	s.AddFunc("", d)
-	s.ModifyFunc("", d)
-	s.DeleteFunc("", d)
-	s.ModifyDNFunc("", d)
-	s.CompareFunc("", d)
-	s.AbandonFunc("", d)
-	s.ExtendedFunc("", d)
-	s.UnbindFunc("", d)
-	s.CloseFunc("", d)
+	for _, reqID := range validRequestIDs {
+		s.Handlers[reqID] = make(map[string]interface{})
+	}
 	s.Stats = nil
 	return s
 }
-func (server *Server) BindFunc(baseDN string, f Binder) {
-	server.BindFns[baseDN] = f
+
+// HandleRequest binds all implemented handler functions on f to the given DN
+// suffix.
+//
+// PacketHandler and CloseHandler are special, they ignore the given baseDN
+// argument and instead select a unique internal identifier.
+func (server *Server) HandleRequest(baseDN string, f interface{}) {
+	matched := false
+
+	if h, ok := f.(BindHandler); ok {
+		server.Handlers[ApplicationBindRequest][baseDN] = h
+		matched = true
+	}
+	if h, ok := f.(SearchHandler); ok {
+		server.Handlers[ApplicationSearchRequest][baseDN] = h
+		matched = true
+	}
+	if h, ok := f.(ModifyHandler); ok {
+		server.Handlers[ApplicationModifyRequest][baseDN] = h
+		matched = true
+	}
+	if h, ok := f.(AddHandler); ok {
+		server.Handlers[ApplicationAddRequest][baseDN] = h
+		matched = true
+	}
+	if h, ok := f.(DeleteHandler); ok {
+		server.Handlers[ApplicationDelRequest][baseDN] = h
+		matched = true
+	}
+	if h, ok := f.(ModifyDNHandler); ok {
+		server.Handlers[ApplicationModifyDNRequest][baseDN] = h
+		matched = true
+	}
+	if h, ok := f.(CompareHandler); ok {
+		server.Handlers[ApplicationCompareRequest][baseDN] = h
+		matched = true
+	}
+	if h, ok := f.(AbandonHandler); ok {
+		server.Handlers[ApplicationAbandonRequest][baseDN] = h
+		matched = true
+	}
+	if h, ok := f.(ExtendedHandler); ok {
+		server.Handlers[ApplicationExtendedRequest][baseDN] = h
+		matched = true
+	}
+
+	if h, ok := f.(PacketHandler); ok {
+		m := server.Handlers[ApplicationSpecialOnPacket]
+		m[strconv.Itoa(len(m))] = h
+		matched = true
+	}
+	if h, ok := f.(CloseHandler); ok {
+		m := server.Handlers[ApplicationSpecialOnClose]
+		m[strconv.Itoa(len(m))] = h
+		matched = true
+	}
+
+	if !matched {
+		panic(errors.Errorf("ldap: Passed object (%T %v) does not satisfy any server handler interfaces", f, f))
+	}
 }
-func (server *Server) SearchFunc(baseDN string, f Searcher) {
-	server.SearchFns[baseDN] = f
+
+// Return the Context that will terminate when the server closes.
+func (server *Server) Context() context.Context {
+	return server.ctx
 }
-func (server *Server) AddFunc(baseDN string, f Adder) {
-	server.AddFns[baseDN] = f
-}
-func (server *Server) ModifyFunc(baseDN string, f Modifier) {
-	server.ModifyFns[baseDN] = f
-}
-func (server *Server) DeleteFunc(baseDN string, f Deleter) {
-	server.DeleteFns[baseDN] = f
-}
-func (server *Server) ModifyDNFunc(baseDN string, f ModifyDNr) {
-	server.ModifyDNFns[baseDN] = f
-}
-func (server *Server) CompareFunc(baseDN string, f Comparer) {
-	server.CompareFns[baseDN] = f
-}
-func (server *Server) AbandonFunc(baseDN string, f Abandoner) {
-	server.AbandonFns[baseDN] = f
-}
-func (server *Server) ExtendedFunc(baseDN string, f Extender) {
-	server.ExtendedFns[baseDN] = f
-}
-func (server *Server) UnbindFunc(baseDN string, f Unbinder) {
-	server.UnbindFns[baseDN] = f
-}
-func (server *Server) CloseFunc(baseDN string, f Closer) {
-	server.CloseFns[baseDN] = f
-}
-func (server *Server) QuitChannel(quit chan bool) {
-	server.Quit = quit
+
+// (TODO) Start shutting down the server.
+func (server *Server) Shutdown() error {
+	server.ctxCancel()
+	// TODO
+	return server.closeErr
 }
 
 func (server *Server) ListenAndServeTLS(listenString string, certFile string, keyFile string) error {
@@ -156,11 +219,56 @@ func (server *Server) ListenAndServeTLS(listenString string, certFile string, ke
 	if err != nil {
 		return err
 	}
-	err = server.serve(ln)
+	return server.serve(ln)
+}
+
+func (server *Server) ListenAndServe(listenString string) error {
+	ln, err := net.Listen("tcp", listenString)
 	if err != nil {
 		return err
 	}
-	return nil
+	return server.serve(ln)
+}
+
+func (server *Server) Serve(ln net.Listener) error {
+	return server.serve(ln)
+}
+
+func (server *Server) serve(ln net.Listener) error {
+	newConn := make(chan net.Conn)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+
+			select {
+			case <-server.ctx.Done():
+				// server is closing, listener was closed
+				break
+			default:
+			}
+
+			if err != nil {
+				server.closeErr = err
+				log.Printf("Error accepting network connection: %s", err.Error())
+				server.ctxClose()
+				break
+			}
+			newConn <- conn
+		}
+	}()
+
+listener:
+	for {
+		select {
+		case c := <-newConn:
+			server.Stats.countConns(1)
+			go server.handleConnection(c)
+		case <-server.ctx.Done():
+			ln.Close()
+			break listener
+		}
+	}
+	return server.closeErr
 }
 
 func (server *Server) SetStats(enable bool) {
@@ -177,47 +285,6 @@ func (server *Server) GetStats() Stats {
 	}()
 	server.Stats.statsMutex.Lock()
 	return *server.Stats
-}
-
-func (server *Server) ListenAndServe(listenString string) error {
-	ln, err := net.Listen("tcp", listenString)
-	if err != nil {
-		return err
-	}
-	err = server.serve(ln)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (server *Server) serve(ln net.Listener) error {
-	newConn := make(chan net.Conn)
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				if !strings.HasSuffix(err.Error(), "use of closed network connection") {
-					log.Printf("Error accepting network connection: %s", err.Error())
-				}
-				break
-			}
-			newConn <- conn
-		}
-	}()
-
-listener:
-	for {
-		select {
-		case c := <-newConn:
-			server.Stats.countConns(1)
-			go server.handleConnection(c)
-		case <-server.Quit:
-			ln.Close()
-			break listener
-		}
-	}
-	return nil
 }
 
 //
@@ -304,6 +371,7 @@ handler:
 				}
 			}
 		case ApplicationUnbindRequest:
+			// TODO - call unbind handler
 			server.Stats.countUnbinds(1)
 			break handler // simply disconnect
 		case ApplicationExtendedRequest:
@@ -355,8 +423,11 @@ handler:
 		}
 	}
 
-	for _, c := range server.CloseFns {
-		c.Close(boundDN, conn)
+	unbindH := routeFunc(boundDN, server.Handlers[ApplicationUnbindRequest])
+	unbindH.(UnbindHandler).Unbind(boundDN, conn)
+
+	for _, h := range server.Handlers[ApplicationSpecialOnClose] {
+		h.(CloseHandler).OnClose(boundDN, conn)
 	}
 
 	conn.Close()
@@ -372,21 +443,26 @@ func sendPacket(conn net.Conn, packet *ber.Packet) error {
 	return nil
 }
 
-//
-func routeFunc(dn string, funcNames []string) string {
-	bestPick := ""
-	for _, fn := range funcNames {
-		if strings.HasSuffix(dn, fn) {
-			l := len(strings.Split(bestPick, ","))
+// Returns the best handler function for the given DN.
+func routeFunc(dn string, handlers handlerMap) interface{} {
+	bestDN := ""
+	var bestHandler interface{} = nil
+	for handlerDN, h := range funcNames {
+		if strings.HasSuffix(dn, handlerDN) {
+			l := strings.Count(bestDN, ",")
 			if bestPick == "" {
 				l = 0
 			}
-			if len(strings.Split(fn, ",")) > l {
-				bestPick = fn
+			if strings.Count(handlerDN, ",") > l || bestHandler == nil {
+				bestDN = handlerDN
+				bestHandler = h
 			}
 		}
 	}
-	return bestPick
+	if bestHandler == nil {
+		return defaultHandler{}
+	}
+	return bestHandler
 }
 
 // TODO - reindent this
@@ -408,39 +484,48 @@ type defaultHandler struct {
 func (h defaultHandler) Bind(bindDN, bindSimplePw string, conn net.Conn) (LDAPResultCode, error) {
 	return LDAPResultInvalidCredentials, nil
 }
+
 func (h defaultHandler) Search(boundDN string, req SearchRequest, conn net.Conn) (ServerSearchResult, error) {
 	return ServerSearchResult{make([]*Entry, 0), []string{}, []Control{}, LDAPResultSuccess}, nil
 }
+
 func (h defaultHandler) Add(boundDN string, req AddRequest, conn net.Conn) (LDAPResultCode, error) {
 	return LDAPResultInsufficientAccessRights, nil
 }
+
 func (h defaultHandler) Modify(boundDN string, req ModifyRequest, conn net.Conn) (LDAPResultCode, error) {
 	return LDAPResultInsufficientAccessRights, nil
 }
+
 func (h defaultHandler) Delete(boundDN, deleteDN string, conn net.Conn) (LDAPResultCode, error) {
 	return LDAPResultInsufficientAccessRights, nil
 }
+
 func (h defaultHandler) ModifyDN(boundDN string, req ModifyDNRequest, conn net.Conn) (LDAPResultCode, error) {
 	return LDAPResultInsufficientAccessRights, nil
 }
+
 func (h defaultHandler) Compare(boundDN string, req CompareRequest, conn net.Conn) (LDAPResultCode, error) {
 	return LDAPResultInsufficientAccessRights, nil
 }
+
 func (h defaultHandler) Abandon(boundDN string, conn net.Conn) error {
 	return nil
 }
+
 func (h defaultHandler) Extended(boundDN string, req ExtendedRequest, conn net.Conn) (LDAPResultCode, error) {
 	return LDAPResultProtocolError, nil
 }
+
 func (h defaultHandler) Unbind(boundDN string, conn net.Conn) (LDAPResultCode, error) {
 	return LDAPResultSuccess, nil
 }
+
 func (h defaultHandler) Close(boundDN string, conn net.Conn) error {
 	conn.Close()
 	return nil
 }
 
-//
 func (stats *Stats) countConns(delta int) {
 	if stats != nil {
 		stats.statsMutex.Lock()
@@ -448,6 +533,7 @@ func (stats *Stats) countConns(delta int) {
 		stats.statsMutex.Unlock()
 	}
 }
+
 func (stats *Stats) countBinds(delta int) {
 	if stats != nil {
 		stats.statsMutex.Lock()
@@ -455,6 +541,7 @@ func (stats *Stats) countBinds(delta int) {
 		stats.statsMutex.Unlock()
 	}
 }
+
 func (stats *Stats) countUnbinds(delta int) {
 	if stats != nil {
 		stats.statsMutex.Lock()
@@ -462,6 +549,7 @@ func (stats *Stats) countUnbinds(delta int) {
 		stats.statsMutex.Unlock()
 	}
 }
+
 func (stats *Stats) countSearches(delta int) {
 	if stats != nil {
 		stats.statsMutex.Lock()
@@ -469,5 +557,3 @@ func (stats *Stats) countSearches(delta int) {
 		stats.statsMutex.Unlock()
 	}
 }
-
-//
