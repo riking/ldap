@@ -1,33 +1,35 @@
 package ldap
 
 import (
+	stdErrors "errors"
 	"log"
-	"net"
-
-	"gopkg.in/asn1-ber.v1"
 )
 
-func HandleBindRequest(req *ber.Packet, fn BindHandler, conn net.Conn) (resultCode LDAPResultCode, done bool, err error) {
+func dispatchBindRequest(w ResponseWriter, ldapReq *Request, fn BindHandler) (resultCode LDAPResultCode, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			resultCode = LDAPResultOperationsError
+			if rErr, ok := r.(error); ok {
+				err = rErr
+			}
 		}
 	}()
+
+	req := ldapReq.reqBody
 
 	// we only support ldapv3
 	ldapVersion, ok := req.Children[0].Value.(uint64)
 	if !ok {
-		return LDAPResultProtocolError, false, nil
+		return LDAPResultProtocolError, stdErrors.New("bad LDAP version")
 	}
 	if ldapVersion != 3 {
-		log.Printf("Unsupported LDAP version: %d", ldapVersion)
-		return LDAPResultInappropriateAuthentication, false, nil
+		return LDAPResultInappropriateAuthentication, stdErrors.New("bad LDAP version, expected 3")
 	}
 
 	// auth types
 	bindDN, ok := req.Children[1].Value.(string)
 	if !ok {
-		return LDAPResultProtocolError, false, nil
+		return LDAPResultProtocolError, stdErrors.New("bad username")
 	}
 	bindAuth := req.Children[2]
 	switch bindAuth.Tag {
@@ -36,43 +38,21 @@ func HandleBindRequest(req *ber.Packet, fn BindHandler, conn net.Conn) (resultCo
 		return LDAPResultInappropriateAuthentication
 	case LDAPBindAuthSimple:
 		if len(req.Children) == 3 {
-			resultCode, err := fn.Bind(bindDN, bindAuth.Data.String(), conn)
-			if err != nil {
-				return LDAPResultOperationsError, false, err
-			}
-			return resultCode, true, nil
+			return fn.Bind(bindDN, bindAuth.Data.String(), conn)
 		} else {
-			return LDAPResultInappropriateAuthentication, false, nil
+			return LDAPResultInappropriateAuthentication, stdErrors.New("bad simple-auth packet")
 		}
 	case LDAPBindAuthSASL:
 		saslFn, ok := fn.(BindSASLHandler)
 		if !ok {
-			return LDAPResultInappropriateAuthentication, false, nil
+			return LDAPResultInappropriateAuthentication, stdErrors.New("SASL auth not supported")
 		}
-		var resultCode LDAPResultCode
-		var isDone bool
-		var err error
+
 		if len(req.Children) == 3 {
-			resultCode, isDone, err = fn.BindSASL(bindDN, req.Children[2].Data.String(), "", conn)
+			return fn.BindSASL(bindDN, req.Children[2].Data.String(), nil, conn)
 		} else if len(req.Children) == 4 {
-			resultCode, isDone, err = fn.BindSASL(bindDN, req.Children[2].Data.String(), req.Children[3].Data.String(), conn)
+			return fn.BindSASL(bindDN, req.Children[2].Data.String(), req.Children[3].Data.Bytes(), conn)
 		}
-		return resultCode, isDone, err
 	}
-	return LDAPResultOperationsError, false, nil
-}
-
-func encodeBindResponse(messageID uint64, ldapResultCode LDAPResultCode) *ber.Packet {
-	responsePacket := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Response")
-	responsePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, messageID, "Message ID"))
-
-	bindReponse := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationBindResponse, nil, "Bind Response")
-	bindReponse.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, uint64(ldapResultCode), "resultCode: "))
-	bindReponse.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "matchedDN: "))
-	bindReponse.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "errorMessage: "))
-
-	responsePacket.AppendChild(bindReponse)
-
-	// ber.PrintPacket(responsePacket)
-	return responsePacket
+	return LDAPResultOperationsError, stdErrors.New("Internal server error")
 }

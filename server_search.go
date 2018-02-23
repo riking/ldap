@@ -9,40 +9,46 @@ import (
 	"gopkg.in/asn1-ber.v1"
 )
 
-func HandleSearchRequest(req *ber.Packet, controls *[]Control, messageID uint64, boundDN string, server *Server, conn net.Conn) (resultErr error) {
+func (server *Server) dispatchSearchRequest(w ResponseWriter, ldapReq *Request, fn SearchHandler) (resultCode LDAPResultCode, resultErr error) {
 	defer func() {
 		if r := recover(); r != nil {
-			resultErr = NewError(LDAPResultOperationsError, fmt.Errorf("Search function panic: %s", r))
+			if rErr, ok := r.(error); ok {
+				resultErr = errors.Wrap(rErr, "search panic")
+			} else {
+				resultErr = errors.Errorf("search panic: %v", r)
+			}
 		}
 	}()
 
-	searchReq, err := parseSearchRequest(boundDN, req, controls)
+	searchReq, err := parseSearchRequest(ldapReq.BoundDN, ldapReq.reqBody, ldapReq.Controls)
 	if err != nil {
-		return NewError(LDAPResultOperationsError, err)
+		return LDAPResultOperationsError, err
 	}
 
 	filterPacket, err := CompileFilter(searchReq.Filter)
 	if err != nil {
-		return NewError(LDAPResultOperationsError, err)
+		return LDAPResultOperationsError, err
 	}
 
-	fnNames := []string{}
-	for k := range server.SearchFns {
-		fnNames = append(fnNames, k)
+	ctx := ldapReq.Context()
+	if searchReq.TimeLimit > 0 {
+		ctx_, cancel := context.WithTimeout(ldapReq.Context(), searchReq.TimeLimit*time.Second)
+		defer cancel()
+		ctx = ctx_
 	}
-	fn := routeFunc(searchReq.BaseDN, fnNames)
-	searchResp, err := server.SearchFns[fn].Search(boundDN, searchReq, conn)
+	ldapReq.ctx = ctx
+	ldapReq.Body = searchReq
+
+	// TODO - allow for streaming searches.
+	searchResp, err := fn.Search(boundDN, searchReq, conn)
 	if err != nil {
-		return NewError(searchResp.ResultCode, err)
+		return searchResp.ResultCode, err
 	}
 
 	if server.EnforceLDAP {
 		if searchReq.DerefAliases != NeverDerefAliases { // [-a {never|always|search|find}
 			// Server DerefAliases not supported: RFC4511 4.5.1.3
-			return NewError(LDAPResultOperationsError, errors.New("Server DerefAliases not supported"))
-		}
-		if searchReq.TimeLimit > 0 {
-			// TODO: Server TimeLimit not implemented
+			return LDAPResultOperationsError, errors.New("Server DerefAliases not supported")
 		}
 	}
 
@@ -83,7 +89,7 @@ func HandleSearchRequest(req *ber.Packet, controls *[]Control, messageID uint64,
 			if len(searchReq.Attributes) > 1 || (len(searchReq.Attributes) == 1 && len(searchReq.Attributes[0]) > 0) {
 				entry, err = filterAttributes(entry, searchReq.Attributes)
 				if err != nil {
-					return NewError(LDAPResultOperationsError, err)
+					return LDAPResultOperationsError, err
 				}
 			}
 		}
@@ -91,10 +97,10 @@ func HandleSearchRequest(req *ber.Packet, controls *[]Control, messageID uint64,
 		// respond
 		responsePacket := encodeSearchResponse(messageID, searchReq, entry)
 		if err = sendPacket(conn, responsePacket); err != nil {
-			return NewError(LDAPResultOperationsError, err)
+			return LDAPResultOperationsError, err
 		}
 	}
-	return nil
+	return LDAPResultSuccess, nil
 }
 
 /////////////////////////
@@ -204,13 +210,25 @@ func encodeSearchAttribute(name string, values []string) *ber.Packet {
 	return packet
 }
 
-func encodeSearchDone(messageID uint64, ldapResultCode LDAPResultCode) *ber.Packet {
-	responsePacket := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Response")
-	responsePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, messageID, "Message ID"))
-	donePacket := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationSearchResultDone, nil, "Search result done")
-	donePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagEnumerated, uint64(ldapResultCode), "resultCode: "))
-	donePacket.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "matchedDN: "))
-	donePacket.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "errorMessage: "))
+func encodeSearchDone(w ResponseWriter, ldapResultCode LDAPResultCode, errMsg string) *ber.Packet {
+	responsePacket := ber.Encode(ber.ClassUniversal, ber.TypeConstructed,
+		ber.TagSequence, nil, "LDAP Response",
+	)
+	responsePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive,
+		ber.TagInteger, w.messageID, "Message ID",
+	))
+	donePacket := ber.Encode(ber.ClassApplication, ber.TypeConstructed,
+		ApplicationSearchResultDone, nil, "Search result done",
+	)
+	donePacket.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimitive,
+		ber.TagEnumerated, uint64(ldapResultCode), "resultCode: ",
+	))
+	donePacket.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive,
+		ber.TagOctetString, w.matchedDN, "matchedDN: ",
+	))
+	donePacket.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive,
+		ber.TagOctetString, errMsg, "errorMessage: ",
+	))
 	responsePacket.AppendChild(donePacket)
 
 	return responsePacket
